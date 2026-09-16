@@ -16,7 +16,7 @@ from playtrafi.models import (
 from playtrafi.pool import BrowserContextPool
 from playtrafi.proxy import ProxyItem, ProxyManager
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __author__ = "marcuz-apl"
 __license__ = "Apache-2.0"
 __copyright__ = "Copyright 2026 Alfazen Inc."

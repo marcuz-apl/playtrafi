@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,43 @@ from playtrafi.utils import (
 )
 
 logger = logging.getLogger("playtrafi.crawler")
+
+def _browser_headers(user_agent: str) -> dict[str, str]:
+    """Browser-grade navigation headers for HTTP fallback.
+
+    A bare User-Agent + Accept-Language pair is a classic automation
+    fingerprint (bot managers like Cloudflare challenge it outright), so the
+    fallback must present the full top-of-navigation header set. Client hints
+    are derived from the UA string itself so the brand version never
+    contradicts it.
+    """
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    chrome = re.search(r"Chrome/(\d+)", user_agent)
+    if chrome and "Edg/" not in user_agent:
+        if "Windows NT" in user_agent:
+            platform = '"Windows"'
+        elif "Macintosh" in user_agent:
+            platform = '"macOS"'
+        else:
+            platform = '"Linux"'
+        v = chrome.group(1)
+        headers.update(
+            {
+                "Sec-Ch-Ua": f'"Google Chrome";v="{v}", "Chromium";v="{v}", "Not_A Brand";v="24"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": platform,
+            }
+        )
+    return headers
 
 
 class AsyncPlaytrafi:
@@ -137,6 +175,9 @@ class AsyncPlaytrafi:
                 )
 
                 status_code = resp.status if resp else 200
+                # A rendered bot challenge (403/5xx) must not masquerade as a
+                # success: the page *rendered*, but the request was refused.
+                success_flag = True if resp is None else bool(200 <= resp.status < 400)
 
                 if wait_for_selector:
                     try:
@@ -195,7 +236,7 @@ class AsyncPlaytrafi:
                     metadata=metadata,
                     screenshot_bytes=screenshot_bytes,
                     pdf_bytes=pdf_bytes,
-                    success=True,
+                    success=success_flag,
                     engine_used="patchright",
                     elapsed_s=round(elapsed, 3),
                 )
@@ -215,12 +256,12 @@ class AsyncPlaytrafi:
         browser_error: str,
     ) -> ScrapeResult:
         """Fast direct HTTP fallback when browser engine is unavailable or timed out."""
-        headers = {"User-Agent": user_agent, "Accept-Language": "en-US,en;q=0.9"}
+        headers = _browser_headers(user_agent)
         try:
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=self.config.browser_timeout_s,
-                verify=False,
+                verify=self.config.verify_tls,
             ) as client:
                 resp = await client.get(url, headers=headers)
                 html = resp.text
@@ -270,12 +311,19 @@ class AsyncPlaytrafi:
         wait_for: str | None = None,
         custom_schema: dict[str, Any] | None = None,
     ) -> list[ScrapeResult]:
-        """Scrape multiple URLs concurrently bounded by the BrowserContextPool."""
-        tasks = [
-            self.scrape(url, wait_for=wait_for, custom_schema=custom_schema)
-            for url in urls
-        ]
-        return await asyncio.gather(*tasks)
+        """Scrape multiple URLs concurrently bounded by ``max_concurrency``.
+
+        The browser pool itself caps live contexts, but with ``http_fallback``
+        enabled a failing batch would otherwise run one unconditional HTTP
+        request per URL simultaneously — a burst bot managers punish.
+        """
+        sem = asyncio.Semaphore(max(1, self.config.max_concurrency))
+
+        async def _one(target: str) -> ScrapeResult:
+            async with sem:
+                return await self.scrape(target, wait_for=wait_for, custom_schema=custom_schema)
+
+        return await asyncio.gather(*(_one(u) for u in urls))
 
     @classmethod
     async def crawl(

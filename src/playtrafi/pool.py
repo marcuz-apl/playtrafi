@@ -71,6 +71,14 @@ class BrowserContextPool:
             except Exception as exc:
                 logger.warning("Failed to initialize BrowserContextPool browser: %s", exc)
                 self._browser = None
+                # A half-started driver would leak here: without stopping it,
+                # the next start() would spawn a second playwright instance.
+                if self._playwright is not None:
+                    try:
+                        await self._playwright.stop()
+                    except Exception:
+                        pass
+                    self._playwright = None
 
     async def close(self) -> None:
         """Terminate all pooled contexts and close the browser."""
@@ -126,7 +134,21 @@ class BrowserContextPool:
             if chosen_proxy:
                 context_kwargs["proxy"] = {"server": chosen_proxy}
 
-            context = await self._browser.new_context(**context_kwargs)
+            try:
+                context = await self._browser.new_context(**context_kwargs)
+            except Exception:
+                # A crashed browser process must be resurrectable: drop the
+                # stale handle so the next acquire_context relaunches cleanly
+                # instead of failing forever on the dead object.
+                connected = False
+                try:
+                    connected = bool(self._browser.is_connected())
+                except Exception:
+                    connected = False
+                if not connected:
+                    async with self._lock:
+                        self._browser = None
+                raise
             self._active_contexts += 1
             try:
                 yield context, chosen_proxy

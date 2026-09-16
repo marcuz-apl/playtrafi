@@ -39,6 +39,10 @@ class PlaytrafiConfig(BaseModel):
         default=True,
         description="Automatically fall back to direct HTTP request if browser crashes or times out."
     )
+    verify_tls: bool = Field(
+        default=True,
+        description="Verify TLS certificates on the HTTP fallback path. Disable only for known-bad-chain targets."
+    )
     extract_schema: bool = Field(
         default=True,
         description="Extract JSON-LD and Next.js __NEXT_DATA__ structured items."
